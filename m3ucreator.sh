@@ -6,9 +6,9 @@ IFS=$'\n'
 usage() {
   cat <<EOF
 Usage: $0 [-n|--dry-run] [--debug] [base_path]
-  -n, --dry-run    Preview actions without file operations
-  --debug          Show detailed debug output
-  base_path        Directory to scan (default: current directory)
+  -n, --dry-run    Preview without changes
+  --debug          Show debug output
+  base_path        Directory to scan (default: current)
 EOF
   exit 1
 }
@@ -24,92 +24,116 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 BASE_PATH="${BASE_PATH:-.}"
-$DEBUG && echo "[DEBUG] Scanning base: $BASE_PATH"
+$DEBUG && echo "[DEBUG] Scanning: $BASE_PATH"
 
-# Emacs-style regex for supported image formats
+# Regex for disc formats
 EXT_REGEX='.*\.\(iso\|bin\|cue\|mdf\|mds\|nrg\|chd\|ccd\|img\|sub\|cdi\|toc\)$'
 
-# Find files, excluding 'bios' and any '*.m3u' directories
+# Collect ALL files, don't exclude .m3u dirs during initial scan
 mapfile -t files < <(
   find "$BASE_PATH" \
-    -type d \( -iname bios -o -iname '*.m3u' \) -prune -o \
+    -type d \( -iname bios \) -prune -o \
     -type f -iregex "$EXT_REGEX" -print
 )
-$DEBUG && echo "[DEBUG] Found ${#files[@]} disc files"
+$DEBUG && echo "[DEBUG] Found ${#files[@]} files"
 
 declare -A groups
 
-# Group only files marked as multi-disc
+# Group multi-disc files - improved regex pattern
 for f in "${files[@]}"; do
   name=$(basename "$f")
-  [[ "$name" =~ \([Dd]isc[[:space:]][0-9]+\) ]] || continue
-  dir=$(dirname "$f")
-  base="${name%.*}"                     # Strip final extension
-  game="${base% *(Disc*}"               # Remove disc suffix
-  key="$dir|$game"
-  groups["$key"]+="$f"$'\n'
+  # More flexible disc pattern matching
+  if [[ "$name" =~ \([Dd]isc[[:space:]]*[0-9]+\) ]] || [[ "$name" =~ [Dd]isc[[:space:]]*[0-9]+ ]]; then
+    dir=$(dirname "$f")
+    base="${name%.*}"
+    # Remove disc suffix more comprehensively
+    game=$(echo "$base" | sed -E 's/[[:space:]]*[\(\[]?[Dd]isc[[:space:]]*[0-9]+[\)\]]?.*$//')
+    key="$dir|$game"
+    groups["$key"]+="$f"$'\n'
+    $DEBUG && echo "[DEBUG] Added to group '$game': $name"
+  fi
 done
-$DEBUG && echo "[DEBUG] Grouped into ${#groups[@]} games"
+$DEBUG && echo "[DEBUG] Groups: ${#groups[@]}"
 
-# Process each multi-disc game
+# Process each game
 for key in "${!groups[@]}"; do
   IFS='|' read -r dir game <<< "$key"
-  readarray -t discs <<< "${groups[$key]}"
-  (( ${#discs[@]} > 1 )) || continue
+  
+  # Fix: Filter out empty entries when reading array
+  mapfile -t discs < <(printf '%s' "${groups[$key]}" | grep -v '^$')
+  
+  (( ${#discs[@]} > 1 )) || { $DEBUG && echo "[DEBUG] Skipping single disc: $game"; continue; }
 
-  # Remove any existing playlist
-  old_m3u="$dir/$game.m3u"
-  if [[ -f "$old_m3u" ]]; then
-    $DEBUG && echo "[DEBUG] Deleting existing playlist: $old_m3u"
-    $DRY_RUN || rm "$old_m3u"
+  # Check if already in correct folder structure
+  parent=$(basename "$dir")
+  need_folder=true
+  if [[ "$parent" == "$game.m3u" ]]; then
+    $DEBUG && echo "[DEBUG] Already in $parent folder"
+    dest="$dir"
+    need_folder=false
+  else
+    dest="$dir/$game.m3u"
+    $DEBUG && echo "[DEBUG] Creating folder: $dest"
+    if [[ "$DRY_RUN" == false ]]; then
+      mkdir -p "$dest"
+    fi
   fi
 
-  # Generate new playlist with numeric sorting
-  new_m3u="$dir/$game.m3u"
-  $DEBUG && echo "[DEBUG] Generating playlist: $new_m3u"
-  $DRY_RUN || printf '#EXTM3U\n' > "$new_m3u"
+  # Remove old playlist if creating new folder
+  if [[ "$need_folder" == true ]]; then
+    old="$dir/$game.m3u"
+    if [[ -f "$old" ]]; then
+      $DEBUG && echo "[DEBUG] Removing old playlist: $old"
+      $DRY_RUN || rm "$old"
+    fi
+  fi
 
-  # Build an array of basename entries
+  # Generate playlist
+  m3u="$dest/$game.m3u"
+  $DEBUG && echo "[DEBUG] Creating playlist: $m3u"
+  $DRY_RUN || printf '#EXTM3U\n' > "$m3u"
+
+  # Build entries array with descriptor preference
   entries=()
   for disc in "${discs[@]}"; do
+    [[ -n "$disc" ]] || continue  # Skip empty entries
     bn=$(basename "$disc")
     case "${disc,,}" in
       *.cue|*.ccd|*.toc) entries+=("$bn") ;;
       *)
         cue="${disc%.*}.cue"
-        if [[ ! -f "$dir/$(basename "$cue")" ]]; then
+        if [[ ! -f "$(dirname "$disc")/$(basename "$cue")" ]]; then
           entries+=("$bn")
         fi ;;
     esac
   done
 
-  # Sort by disc number extracted from "(Disc N)"
-  IFS=$'\n' sorted=($(printf '%s\n' "${entries[@]}" \
-    | awk -F '[()]' '/[Dd]isc/ {print $2 " " $0}' \
-    | sort -n \
-    | cut -d' ' -f2-))
-  unset IFS
+  # Sort by disc number WITHOUT adding prefixes to final output
+  declare -a sorted_entries
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && sorted_entries+=("$line")  # Only add non-empty lines
+  done < <(printf '%s\n' "${entries[@]}" | sort -V)
 
-  # Write sorted entries to playlist
-  for entry in "${sorted[@]}"; do
-    if $DRY_RUN; then
+  # Write entries to playlist
+  for entry in "${sorted_entries[@]}"; do
+    if [[ "$DRY_RUN" == true ]]; then
       echo "  - $entry"
     else
-      echo "$entry" >> "$new_m3u"
+      echo "$entry" >> "$m3u"
     fi
     $DEBUG && echo "[DEBUG] Added entry: $entry"
   done
 
-  # Create destination folder and move files
-  dest="$dir/${game}.m3u"
-  $DEBUG && echo "[DEBUG] Creating folder: $dest"
-  $DRY_RUN || mkdir -p "$dest"
-  for disc in "${discs[@]}"; do
-    $DEBUG && echo "[DEBUG] Moving: $disc → $dest/"
-    $DRY_RUN || mv "$disc" "$dest/"
-  done
-  $DEBUG && echo "[DEBUG] Moving playlist: $new_m3u → $dest/"
-  $DRY_RUN || mv "$new_m3u" "$dest/"
+  # Move files only if we created a new folder
+  if [[ "$need_folder" == true ]]; then
+    for disc in "${discs[@]}"; do
+      [[ -n "$disc" ]] || continue  # Skip empty entries
+      bn=$(basename "$disc")
+      $DEBUG && echo "[DEBUG] Moving: $disc → $dest/$bn"
+      $DRY_RUN || mv "$disc" "$dest/$bn"
+    done
+  fi
 
-  echo "Processed game: $game"
+  echo "Processed: $game"
+  unset sorted_entries
 done
